@@ -1,0 +1,136 @@
+name: Snyk Scans (monorepo)
+# Per-component scanning. Replace YOUR-ORG below.
+#
+# Under ~20 manifests, snyk-scans.yml with
+# extra-args: "--all-projects --detection-depth=4" is simpler. Past that, code
+# scanning rejects the upload: it takes at most 20 SARIF runs per file and
+# --all-projects writes one per manifest. Use the matrix below instead.
+#
+# All components share the repo URL, so they land on ONE Snyk target and are
+# distinguished by project name and the component= tag.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main, master]
+  merge_group:
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+  actions: read
+concurrency:
+  group: snyk-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  sca:
+    name: SCA (${{ matrix.c.name }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # One broken component must not cancel the others' results.
+      fail-fast: false
+      matrix:
+        c:
+          - { name: api,     path: services/api }
+          - { name: workers, path: services/workers }
+          - { name: web,     path: apps/web }
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: YOUR-ORG/snyk-scan-templates/sca@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"
+          working-directory: ${{ matrix.c.path }}
+          monitor: ${{ github.event_name == 'push' }}
+          target-reference: ${{ github.ref_name }}
+          # Manifest filenames repeat across components, so auto-detection
+          # names all three "package.json" under one target and they overwrite
+          # each other. Qualify with the component path.
+          project-name: ${{ matrix.c.path }}/package.json
+          project-tags: repo=${{ github.repository }},component=${{ matrix.c.name }}
+          # MUST be unique per leg: it is both the code scanning category and
+          # the PR comment marker.
+          comment-marker: snyk-sca-${{ matrix.c.name }}
+  code:
+    name: Code (${{ matrix.c.name }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        c:
+          - { name: api,     path: services/api }
+          - { name: workers, path: services/workers }
+          - { name: web,     path: apps/web }
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # snyk code test has no --all-projects: it scans one path per run, so
+      # per-component SAST means one job per component either way.
+      - uses: YOUR-ORG/snyk-scan-templates/code@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"
+          working-directory: ${{ matrix.c.path }}
+          monitor: ${{ github.event_name == 'push' }}
+          target-reference: ${{ github.ref_name }}
+          project-name: ${{ matrix.c.name }} Code Scan
+          project-tags: repo=${{ github.repository }},component=${{ matrix.c.name }}
+          comment-marker: snyk-code-${{ matrix.c.name }}
+  # IaC stays repo-wide: manifests are usually shared infra rather than
+  # per-component, and one walk of the tree is cheaper than three.
+  iac:
+    name: IaC
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: YOUR-ORG/snyk-scan-templates/iac@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"
+          monitor: ${{ github.event_name == 'push' }}
+          target-reference: ${{ github.ref_name }}
+          project-tags: repo=${{ github.repository }}
+          # Bound the walk; `snyk iac test` has no --exclude.
+          detection-depth: "5"
+  container:
+    name: Container (${{ matrix.c.name }})
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        c:
+          - { name: api,     path: services/api }
+          - { name: workers, path: services/workers }
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Build
+        id: img
+        env:
+          REPO: ${{ github.repository }}
+          COMPONENT: ${{ matrix.c.name }}
+          CTX: ${{ matrix.c.path }}
+        run: |
+          name="$(printf '%s-%s' "$REPO" "$COMPONENT" | tr '[:upper:]' '[:lower:]')"
+          docker build -t "${name}:${GITHUB_SHA}" "$CTX"
+          echo "name=${name}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      # Each image is its own Snyk target. project-name must differ per image:
+      # container monitor has no --remote-repo-url and no --target-name.
+      - uses: YOUR-ORG/snyk-scan-templates/container@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"
+          image: ${{ steps.img.outputs.name }}
+          project-name: ${{ matrix.c.name }} image
+          pr-comment: "false"
+          monitor: "true"
+          target-reference: ${{ github.ref_name }}
+          project-tags: repo=${{ github.repository }},component=${{ matrix.c.name }}
+          comment-marker: snyk-container-${{ matrix.c.name }}

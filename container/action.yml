@@ -1,0 +1,336 @@
+name: Snyk Container scan
+description: >
+  Scan an already-built image (snyk container test). Build the image first. This is the one scan the Snyk SCM integration cannot do, because the image never exists in Git.
+
+inputs:
+  image:
+    description: Image to scan, e.g. local/app:sha. Build it before calling this.
+    required: true
+  dockerfile:
+    description: Dockerfile path, for base image upgrade advice. Skipped if absent.
+    default: Dockerfile
+  exclude-app-vulns:
+    description: >
+      "true" scans OS packages only, so app deps are not double-counted against
+      SCA. This is a real coverage gap, not just deduplication: the sca action
+      scans manifests in the REPO, while app-vulns scans what is actually
+      installed in the IMAGE. Anything baked in by the Dockerfile but absent
+      from the repo manifests (a pip install in a RUN line, a vendored jar, a
+      dependency of the base image) is then scanned by neither. Set "false" if
+      your images install anything the repo manifests do not describe.
+    default: "true"
+  monitor:
+    description: '"true" snapshots the image to Snyk for ongoing tracking. Default branch only.'
+    default: "false"
+  monitor-required:
+    description: >
+      "true" fails the job when the Snyk snapshot cannot be published.
+      Default "false": the scan and its SARIF are what gate the branch, so a failed
+      upload is a loud warning rather than a red security check. Snyk documents
+      container monitor exit 2 as retryable, and the action retries 3 times
+      before reporting. Exit 3 (no supported projects) is not retried.
+    default: "false"
+  project-name:
+    description: >
+      Snyk project name for monitor. Defaults to "Container Image": the image
+      is always its own target, keyed on the image, so the target already
+      says which image this is and the project only needs to say what the
+      scan is. SET SOMETHING IMAGE-SPECIFIC if one Snyk org holds many
+      images: `snyk container monitor` accepts no --remote-repo-url and no
+      --target-name, so you cannot disambiguate at the target level from the
+      CLI, and every image in the org shows the same project name in
+      org-wide project lists, reports and tag filters.
+    default: Container Image
+  target-reference:
+    description: Branch or version grouping for monitor snapshots.
+    default: ""
+  snyk-token:
+    description: Snyk API token. Set it as a repo or org secret.
+    required: true
+  snyk-org:
+    description: Snyk org slug or UUID. Only needed if your token spans orgs.
+    default: ""
+  project-tags:
+    description: >
+      Comma-separated key=value tags applied to the published project, e.g.
+      "app=nodejs-goof". Snyk will not put every scan type under one target
+      from the CLI, so a shared tag is how you get one filtered view across
+      SCA, Code, IaC and container. Snyk documents `container monitor` as
+      FAILING when an option that sets project attributes is used and the role
+      cannot edit project attributes.
+    default: ""
+  severity-threshold:
+    description: "low | medium | high | critical. Findings below this are ignored."
+    default: high
+  fail-on-findings:
+    description: >
+      "true" fails this check when findings exist. Leave "false" and let the
+      code scanning check do the blocking instead, or you gate twice.
+    default: "false"
+  upload-sarif:
+    description: >
+      "true" sends results to GitHub code scanning: PR diff annotations, new
+      vs existing alert detection, and the alerts UI. Free on public repos;
+      private repos need GitHub Code Security.
+    default: "true"
+  pr-comment:
+    description: '"true" posts/updates one sticky comment on the PR.'
+    default: "true"
+  working-directory:
+    description: >
+      Where output files land. The image is scanned by name, not from this
+      directory; only the Dockerfile lookup and the report files are relative
+      to it.
+    default: "."
+  extra-args:
+    description: >
+      Extra Snyk CLI flags, appended verbatim and UNQUOTED, so a value
+      containing spaces will word-split. Never put registry credentials here:
+      --username/--password would be word-split into the run log by the
+      runner's own command tracing. Use docker/login-action instead.
+    default: ""
+  comment-marker:
+    description: >
+      Identifies this scan's sticky comment and its code scanning category.
+      Only change it if you call this action twice in one repo.
+    default: snyk-container
+  snyk-cli-version:
+    description: >
+      A version like "1.1306.1", or "latest". Pinning is recommended for a
+      gating workflow.
+    default: latest
+  verify-cli-gpg:
+    description: >
+      "true" also verifies the CDN's GPG-signed sha256sums.txt.asc against
+      Snyk's published key fingerprint.
+    default: "false"
+  github-token:
+    description: Token used to read the PR and write the comment.
+    default: ${{ github.token }}
+
+outputs:
+  exit-code:
+    description: "Snyk CLI exit code: 0 clean, 1 findings, 2 error, 3 nothing to scan."
+    value: ${{ steps.scan.outputs.code }}
+  results-file:
+    description: SARIF path, relative to working-directory.
+    value: snyk-container.sarif
+
+runs:
+  using: composite
+  steps:
+    - name: Check token
+      shell: bash
+      env:
+        SNYK_TOKEN: ${{ inputs.snyk-token }}
+      run: |
+        if [ -z "$SNYK_TOKEN" ]; then
+          echo "::error::snyk-token is empty. Set the SNYK_TOKEN secret on this repo or org."
+          exit 1
+        fi
+
+    - name: Warn on credentials or debug flags in extra-args
+      shell: bash
+      env:
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+      run: |
+        case " $EXTRA_ARGS " in
+          *--password*|*--username*)
+            echo "::error::extra-args carries --username/--password. The runner traces this step's command line into the log, so a registry credential passed here is written to the run log verbatim. Use docker/login-action before this step instead."
+            exit 1 ;;
+        esac
+        case " $EXTRA_ARGS " in
+          *" -d "*|*" --debug "*|*DEBUG=*)
+            echo "::warning::extra-args enables Snyk debug output. Debug logs are"
+            echo "::warning::verbose and Snyk does not document them as redacted."
+            echo "::warning::Do not use this on a public repo, where run logs are world-readable." ;;
+        esac
+
+    - name: Install Snyk CLI
+      shell: bash
+      env:
+        SNYK_VERSION: ${{ inputs.snyk-cli-version }}
+        SNYK_VERIFY_GPG: ${{ inputs.verify-cli-gpg }}
+      run: bash "${{ github.action_path }}/../scripts/install-snyk.sh"
+
+    - name: Resolve names
+      id: names
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        PROJECT_NAME: ${{ inputs.project-name }}
+        GH_REPO: ${{ github.repository }}
+        SEVERITY: ${{ inputs.severity-threshold }}
+      run: |
+        repo_lc=$(printf '%s' "$GH_REPO" | tr '[:upper:]' '[:lower:]')
+        img="${IMAGE%%:*}"                 # image without tag
+        tag="${IMAGE#"$img"}"; tag="${tag#:}"
+        # The target already carries the image, so a fixed project name is
+        # enough, and it stops a :$SHA tag forking a project every push.
+        [ -n "$PROJECT_NAME" ] || PROJECT_NAME="Container Image"
+        if [ "$PROJECT_NAME" = "Container Image" ]; then
+          echo "::notice::project-name is the generic default 'Container Image'. snyk container monitor accepts no --remote-repo-url or --target-name, so if this Snyk org holds several images they will all carry this name. Set project-name per image."
+        fi
+        echo "project=$PROJECT_NAME" >> "$GITHUB_OUTPUT"
+        # Title keeps the tag so the report says exactly what was scanned.
+        qualified="$img"
+        case "$img" in
+          "$repo_lc"|"$repo_lc"/*) ;;
+          *) qualified="${repo_lc}/${img}" ;;
+        esac
+        short="$tag"
+        case "$tag" in
+          [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) short="${tag:0:7}" ;;
+        esac
+        [ -n "$short" ] && qualified="${qualified}:${short}"
+        echo "title=${qualified} (${SEVERITY}+)" >> "$GITHUB_OUTPUT"
+
+    - name: Container scan
+      id: scan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SNYK_TOKEN: ${{ inputs.snyk-token }}
+        SNYK_CFG_ORG: ${{ inputs.snyk-org }}
+        SEVERITY: ${{ inputs.severity-threshold }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+        IMAGE: ${{ inputs.image }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        EXCLUDE_APP_VULNS: ${{ inputs.exclude-app-vulns }}
+      run: |
+        set +e
+        args=()
+        if [ -n "$DOCKERFILE" ] && [ -f "$DOCKERFILE" ]; then
+          args+=(--file="$DOCKERFILE")
+        else
+          echo "::warning::Dockerfile '$DOCKERFILE' not found; no base image upgrade advice."
+        fi
+        [ "$EXCLUDE_APP_VULNS" = "true" ] && args+=(--exclude-app-vulns)
+        snyk container test "$IMAGE" "${args[@]}" --severity-threshold="$SEVERITY" --sarif-file-output=snyk-container.sarif --json-file-output=snyk-container.json $EXTRA_ARGS 2>&1 | tee snyk-container.log
+        echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - name: Diagnose
+      id: diag
+      if: always()
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CLASSIFY_LOG: snyk-container.log
+        CLASSIFY_EXIT: ${{ steps.scan.outputs.code }}
+        CLASSIFY_SCAN: Container
+      run: python3 "${{ github.action_path }}/../scripts/classify.py"
+
+    - name: Report
+      if: always()
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        TITLE: ${{ steps.names.outputs.title }}
+        FILE: snyk-container.sarif
+        EXIT_CODE: ${{ steps.scan.outputs.code }}
+        MARKER: ${{ inputs.comment-marker }}
+        PR_COMMENT: ${{ inputs.pr-comment }}
+        ERROR_MESSAGE: ${{ steps.diag.outputs.message }}
+        ERROR_HINT: ${{ steps.diag.outputs.hint }}
+      run: bash "${{ github.action_path }}/../scripts/report.sh"
+
+    - name: Monitor
+      if: inputs.monitor == 'true' && (steps.scan.outputs.code == '0' || steps.scan.outputs.code == '1')
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SNYK_TOKEN: ${{ inputs.snyk-token }}
+        SNYK_CFG_ORG: ${{ inputs.snyk-org }}
+        IMAGE: ${{ inputs.image }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        EXCLUDE_APP_VULNS: ${{ inputs.exclude-app-vulns }}
+        PROJECT_NAME: ${{ steps.names.outputs.project }}
+        TARGET_REF: ${{ inputs.target-reference }}
+        MONITOR_REQUIRED: ${{ inputs.monitor-required }}
+        TAGS: ${{ inputs.project-tags }}
+      run: |
+        set +e
+        args=()
+        [ -n "$DOCKERFILE" ] && [ -f "$DOCKERFILE" ] && args+=(--file="$DOCKERFILE")
+        [ "$EXCLUDE_APP_VULNS" = "true" ] && args+=(--exclude-app-vulns)
+        [ -n "$TARGET_REF" ] && args+=(--target-reference="$TARGET_REF")
+        [ -n "$TAGS" ] && args+=(--project-tags="$TAGS")
+
+        # snyk container monitor: 0 success, 2 retryable, 3 no supported
+        # projects. No exit 1.
+        code=0
+        for attempt in 1 2 3; do
+          snyk container monitor "$IMAGE" "${args[@]}" --project-name="$PROJECT_NAME"
+          code=$?
+          [ "$code" = "0" ] && break
+          # Exit 3 is a configuration outcome, not transient; retrying it
+          # burns 90s of the job budget for nothing.
+          if [ "$code" = "3" ]; then
+            echo "::warning::Snyk found no supported projects in this image (exit 3); not retrying."
+            break
+          fi
+          if [ "$attempt" -lt 3 ]; then
+            echo "::warning::Snapshot upload failed (exit ${code}); retrying in $((attempt * 30))s."
+            sleep $((attempt * 30))
+          fi
+        done
+
+        if [ "$code" = "0" ]; then
+          echo "Snapshot published to Snyk as '${PROJECT_NAME}'."
+          exit 0
+        fi
+
+        msg="Container: could not publish the snapshot to Snyk (exit ${code}). The scan and its SARIF are unaffected; the Snyk UI project '${PROJECT_NAME}' keeps its previous state. Re-run the job, or re-run with extra-args: \"-d\" on a private repo to capture debug output."
+        if [ "$MONITOR_REQUIRED" = "true" ]; then
+          echo "::error::${msg}"; exit 1
+        fi
+        echo "::warning::${msg}"
+
+    - name: Prepare SARIF
+      if: always() && inputs.upload-sarif == 'true'
+      shell: bash
+      id: sarif
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SARIF_FILE: snyk-container.sarif
+        SARIF_CATEGORY: ${{ inputs.comment-marker }}
+      run: python3 "${{ github.action_path }}/../scripts/sarif-prep.py"
+
+    - name: Upload SARIF
+      if: always() && inputs.upload-sarif == 'true' && steps.sarif.outputs.ok == 'true'
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.working-directory }}/snyk-container.sarif
+        # Must be unique per scan: one analysis per category.
+        category: ${{ inputs.comment-marker }}
+        checkout_path: ${{ github.workspace }}/${{ inputs.working-directory }}
+        token: ${{ inputs.github-token }}
+
+    - name: Gate
+      if: always()
+      shell: bash
+      env:
+        CODE: ${{ steps.scan.outputs.code }}
+        MESSAGE: ${{ steps.diag.outputs.message }}
+        HINT: ${{ steps.diag.outputs.hint }}
+        FAIL_ON: ${{ inputs.fail-on-findings }}
+        SEVERITY: ${{ inputs.severity-threshold }}
+      run: |
+        # Fail closed: only 0, 1 and 3 are known-good. An unset code fails.
+        case "${CODE:-none}" in
+          0)
+            echo "Container: clean." ;;
+          3)
+            echo "Container: nothing to scan." ;;
+          1)
+            if [ "$FAIL_ON" = "true" ]; then
+              echo "::error::Container: findings at ${SEVERITY}+ severity."; exit 1
+            fi
+            echo "Container: findings reported, not gated here." ;;
+          *)
+            echo "::error::${MESSAGE:-Container: scan failed (exit ${CODE:-unknown}).} ${HINT}"
+            exit 1 ;;
+        esac

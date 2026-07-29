@@ -1,0 +1,46 @@
+name: Snyk IaC
+# Terraform, CloudFormation, Kubernetes and ARM. Copy to .github/workflows/,
+# replace YOUR-ORG. Reports by default; see README.md to make it block merges.
+#
+# Never install dependencies in this job. snyk iac test walks the whole tree,
+# chokes on malformed JSON in node_modules, and has no --exclude flag.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main, master]
+  merge_group:         # needed if the code scanning check is required
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: write    # PR comment
+  security-events: write  # SARIF upload
+  actions: read           # code scanning on private repos
+concurrency:
+  group: snyk-iac-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  iac:
+    name: IaC
+    # Fork PRs get no secrets. A skipped job passes required checks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: YOUR-ORG/snyk-scan-templates/iac@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"
+          severity-threshold: high       # low | medium | high | critical
+          fail-on-findings: "false"      # "true" blocks on the backlog too
+          upload-sarif: "true"
+          pr-comment: "true"
+          detection-depth: "5"           # the only way to bound the walk
+          # monitor adds --report. Needs a role that can edit project
+          # attributes, and cannot be combined with a --rules bundle.
+          monitor: ${{ github.event_name == 'push' }}
+          target-reference: ${{ github.ref_name }}
+          project-tags: app=${{ github.event.repository.name }}
+          # Scan plan output: extra-args: "--scan=planned-values plan.json"
+          # Custom rules:     extra-args: "--rules=bundle.tar.gz"  (no monitor)

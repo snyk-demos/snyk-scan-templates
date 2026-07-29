@@ -1,0 +1,44 @@
+name: Snyk Code
+# SAST on your own source. Copy to .github/workflows/, replace YOUR-ORG.
+# Reports by default. See README.md for how to make it block merges.
+# No critical severity exists in Snyk Code; "critical" is lowered to "high".
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main, master]
+  merge_group:         # needed if the code scanning check is required
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: write    # PR comment
+  security-events: write  # SARIF upload
+  actions: read           # code scanning on private repos
+concurrency:
+  group: snyk-code-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  code:
+    name: Code
+    # Fork PRs get no secrets. A skipped job passes required checks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: YOUR-ORG/snyk-scan-templates/code@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"   # --report needs v1.1297.0+
+          severity-threshold: high       # low | medium | high
+          fail-on-findings: "false"      # "true" blocks on the backlog too
+          upload-sarif: "true"
+          pr-comment: "true"
+          # monitor adds --report, which 403s unless the token's role has
+          # "View Project Ignores".
+          monitor: ${{ github.event_name == 'push' }}
+          target-reference: ${{ github.ref_name }}
+          project-tags: app=${{ github.event.repository.name }}
+          project-name: Code Scan   # required with --report
+          # snyk code test has no --all-projects: one path per run. Per
+          # component, use a matrix and give each leg its own comment-marker.

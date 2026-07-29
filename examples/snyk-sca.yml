@@ -1,0 +1,48 @@
+name: Snyk SCA
+# Open source dependency scan. Copy to .github/workflows/, replace YOUR-ORG.
+# Reports by default. See README.md for how to make it block merges.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main, master]
+  merge_group:         # needed if the code scanning check is required
+  workflow_dispatch:   # re-run the baseline without an empty commit
+permissions:
+  contents: read
+  pull-requests: write    # PR comment
+  security-events: write  # SARIF upload
+  actions: read           # code scanning on private repos
+concurrency:
+  group: snyk-sca-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel the baseline
+jobs:
+  sca:
+    name: SCA
+    # Fork PRs get no secrets. A skipped job passes required checks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # Pinned toolchain? Add actions/setup-node|python|java here first.
+      - uses: YOUR-ORG/snyk-scan-templates/sca@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"   # "latest" changes the gate silently
+          severity-threshold: high       # low | medium | high | critical
+          fail-on-findings: "false"      # "true" blocks on the backlog too
+          upload-sarif: "true"
+          pr-comment: "true"
+          # snyk test scans RESOLVED deps. "auto" detects the ecosystem;
+          # override with "dotnet restore", "make deps", "skip", etc.
+          install-command: auto
+          monitor: ${{ github.event_name == 'push' }}   # PR branches would fork projects
+          target-reference: ${{ github.ref_name }}
+          project-tags: app=${{ github.event.repository.name }}
+          # project-name auto-detects the manifest filename. Set it when
+          # working-directory is not "." or components collide on one project.
+          #
+          # Monorepo: extra-args: "--all-projects --detection-depth=4".
+          # Past ~20 manifests the SARIF upload is rejected (one run each,
+          # 20 per file); use snyk-scans-monorepo.yml instead.

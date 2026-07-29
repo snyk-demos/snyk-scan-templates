@@ -1,0 +1,121 @@
+name: Snyk Scans
+# Copy to .github/workflows/ and replace YOUR-ORG below.
+#
+# SCA, Code and IaC run on PRs, default-branch pushes and merge-queue entries;
+# the push run is the code scanning baseline and publishes to the Snyk UI.
+# Container runs on push only: the image never exists in Git.
+#
+# The CLI will not put every scan type under one Snyk target, so expect
+# several. A shared project-tags value is the workaround for one filtered view
+# (needs a role that can edit project attributes). For a single target, import
+# via the SCM integration and use snyk-scans-cli-only.yml instead.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main, master]
+  # Required if "Code scanning results" is a required check and this repo uses
+  # a merge queue: without it the check never reports and the merge fails.
+  merge_group:
+  # Re-run the baseline by hand after a token, plan or policy change.
+  workflow_dispatch:
+permissions:
+  contents: read          # actions/checkout
+  pull-requests: write    # sticky PR comment via gh api
+  security-events: write  # upload-sarif
+  actions: read           # required by code scanning on private repos
+concurrency:
+  group: snyk-${{ github.event.pull_request.number || github.ref_name }}
+  # Never cancel a default-branch or merge-queue run: those produce the code
+  # scanning baseline and the Snyk snapshots.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  sca:
+    name: SCA
+    # Fork PRs get no secrets. A skipped job counts as successful for required
+    # checks and uploads no SARIF, so no "Code scanning results" check appears
+    # for that PR. Do not require that check without handling fork PRs.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Pinned by SHA: tags are mutable. Renovate and Dependabot read the
+      # trailing version comment.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # install-command defaults to "auto". Override with e.g.
+      # "dotnet restore", "make deps", or "skip".
+      - uses: YOUR-ORG/snyk-scan-templates/sca@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          # Pin the CLI: on "latest" a CLI release changes this gate silently.
+          snyk-cli-version: "1.1306.1"
+          monitor: ${{ github.event_name == 'push' }}
+          target-reference: ${{ github.ref_name }}
+          project-tags: app=${{ github.event.repository.name }}
+          # project-name auto-detects the manifest filename.
+  code:
+    name: Code
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # --report needs "View Project Ignores" on the token's role, or 403.
+      - uses: YOUR-ORG/snyk-scan-templates/code@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"
+          monitor: ${{ github.event_name == 'push' }}
+          target-reference: ${{ github.ref_name }}
+          project-tags: app=${{ github.event.repository.name }}
+  iac:
+    name: IaC
+    # Do NOT install dependencies here. Snyk IaC walks the whole tree, dies on
+    # malformed JSON in node_modules, and has no --exclude flag.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: YOUR-ORG/snyk-scan-templates/iac@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"
+          monitor: ${{ github.event_name == 'push' }}
+          target-reference: ${{ github.ref_name }}
+          project-tags: app=${{ github.event.repository.name }}
+  container:
+    name: Container
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # Tag with the lowercased repo name; that tag becomes the Snyk target
+      # name. Skips itself when there is no Dockerfile.
+      - name: Resolve image name
+        id: img
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "::notice::No Dockerfile at the repo root; skipping the container scan."
+            echo "exists=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "name=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]'):$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - if: steps.img.outputs.exists == 'true'
+        run: docker build -t "${{ steps.img.outputs.name }}" .
+      - if: steps.img.outputs.exists == 'true'
+        uses: YOUR-ORG/snyk-scan-templates/container@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          snyk-cli-version: "1.1306.1"
+          image: ${{ steps.img.outputs.name }}
+          pr-comment: "false"   # a default-branch push has no PR
+          monitor: "true"
+          target-reference: ${{ github.ref_name }}
+          project-tags: app=${{ github.event.repository.name }}
+          # container monitor takes no --remote-repo-url or --target-name, so
+          # the project name is the only handle distinguishing images.
+          project-name: ${{ github.event.repository.name }} image
